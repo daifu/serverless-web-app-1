@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'sam-app
+
+  Sample SAM Template for sam-app
+
+  '
+Globals:
+  Function:
+    Timeout: 3
+Outputs:
+  WebsiteURL:
+    Value:
+      Fn::GetAtt:
+      - WebsiteBucket
+      - WebsiteURL
+Parameters:
+  CodeBucket:
+    Default: storefront-code-${Stage}-${Region}
+    Description: S3 bucket containing the code deployed by this template
+    Type: String
+  CodeKeyPrefix:
+    Default: WebApplication/1_StaticWebHosting
+    Description: Key prefix for resources referenced from the CodeBucket
+    Type: String
+  Region:
+    Default: us-west-2
+    Type: String
+  Stage:
+    Default: beta
+    Type: String
+Resources:
+  CopyS3ObjectsFunction:
+    Properties:
+      Code:
+        ZipFile: "import os\nimport json\nimport cfnresponse\n\nimport boto3\nfrom\
+          \ botocore.exceptions import ClientError\nclient = boto3.client('s3')\n\n\
+          import logging\nlogger = logging.getLogger()\nlogger.setLevel(logging.INFO)\n\
+          \ndef handler(event, context):\n  logger.info(\"Received event: %s\" % json.dumps(event))\n\
+          \  source_bucket = event['ResourceProperties']['SourceBucket']\n  source_prefix\
+          \ = event['ResourceProperties'].get('SourcePrefix') or ''\n  bucket = event['ResourceProperties']['Bucket']\n\
+          \  prefix = event['ResourceProperties'].get('Prefix') or ''\n\n  result\
+          \ = cfnresponse.SUCCESS\n\n  try:\n    if event['RequestType'] == 'Create'\
+          \ or event['RequestType'] == 'Update':\n      result = copy_objects(source_bucket,\
+          \ source_prefix, bucket, prefix)\n    elif event['RequestType'] == 'Delete':\n\
+          \      result = delete_objects(bucket, prefix)\n  except ClientError as\
+          \ e:\n    logger.error('Error: %s', e)\n    result = cfnresponse.FAILED\n\
+          \n  cfnresponse.send(event, context, result, {})\n\n\ndef copy_objects(source_bucket,\
+          \ source_prefix, bucket, prefix):\n  paginator = client.get_paginator('list_objects_v2')\n\
+          \  page_iterator = paginator.paginate(Bucket=source_bucket, Prefix=source_prefix)\n\
+          \  for key in {x['Key'] for page in page_iterator for x in page['Contents']}:\n\
+          \    dest_key = os.path.join(prefix, os.path.relpath(key, source_prefix))\n\
+          \    if not key.endswith('/'):\n      print 'copy {} to {}'.format(key,\
+          \ dest_key)\n      client.copy_object(CopySource={'Bucket': source_bucket,\
+          \ 'Key': key}, Bucket=bucket, Key = dest_key)\n  return cfnresponse.SUCCESS\n\
+          \ndef delete_objects(bucket, prefix):\n  paginator = client.get_paginator('list_objects_v2')\n\
+          \  page_iterator = paginator.paginate(Bucket=bucket, Prefix=prefix)\n  objects\
+          \ = [{'Key': x['Key']} for page in page_iterator for x in page['Contents']]\n\
+          \  client.delete_objects(Bucket=bucket, Delete={'Objects': objects})\n \
+          \ return cfnresponse.SUCCESS\n"
+      Description: Copies objects from a source S3 bucket to a destination
+      Handler: index.handler
+      Role:
+        Fn::GetAtt:
+        - S3CopyRole
+        - Arn
+      Runtime: python2.7
+      Timeout: 120
+    Type: AWS::Lambda::Function
+  S3CopyRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+        Version: 2012-10-17
+      Path: /storefront/
+      Policies:
+      - PolicyDocument:
+          Statement:
+          - Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Effect: Allow
+            Resource: '*'
+            Sid: AllowLogging
+          - Action:
+            - s3:ListBucket
+            - s3:GetObject
+            Effect: Allow
+            Resource:
+            - Fn::Sub: arn:aws:s3:::${CodeBucket}
+            - Fn::Sub: arn:aws:s3:::${CodeBucket}/${CodeKeyPrefix}/*
+            Sid: SourceBucketReadAccess
+          - Action:
+            - s3:ListBucket
+            - s3:GetObject
+            - s3:PutObject
+            - s3:PutObjectAcl
+            - s3:PutObjectVersionAcl
+            - s3:DeleteObject
+            - s3:DeleteObjectVersion
+            Effect: Allow
+            Resource:
+            - Fn::Sub: arn:aws:s3:::${WebsiteBucket}
+            - Fn::Sub: arn:aws:s3:::${WebsiteBucket}/*
+            Sid: DestBucketWriteAccess
+          Version: 2012-10-17
+        PolicyName: S3Access
+    Type: AWS::IAM::Role
+  WebsiteBucket:
+    Properties:
+      BucketName:
+        Fn::Sub: storefront-${Stage}-${Region}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+    Type: AWS::S3::Bucket
+  WebsiteBucketPolicy:
+    Properties:
+      Bucket:
+        Ref: WebsiteBucket
+      PolicyDocument:
+        Statement:
+        - Action: s3:GetObject
+          Effect: Allow
+          Principal: '*'
+          Resource:
+            Fn::Sub: arn:aws:s3:::${WebsiteBucket}/*
+        Version: 2012-10-17
+    Type: AWS::S3::BucketPolicy
+  WebsiteContent:
+    Properties:
+      Bucket:
+        Ref: WebsiteBucket
+      ServiceToken:
+        Fn::GetAtt:
+        - CopyS3ObjectsFunction
+        - Arn
+      SourceBucket:
+        Ref: CodeBucket
+      SourcePrefix:
+        Fn::Sub: ${CodeKeyPrefix}/website/
+    Type: Custom::S3Objects
+Transform: AWS::Serverless-2016-10-31

@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+    sam-app
+
+    Sample SAM Template for sam-app
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+    Function:
+        Timeout: 3
+
+Parameters:
+    Stage:
+        Type: String
+        Default: 'beta'
+
+    Region:
+        Type: String
+        Default: 'us-west-2'
+
+    CodeKeyPrefix:
+        Type: String
+        Default: WebApplication/1_StaticWebHosting
+        Description: Key prefix for resources referenced from the CodeBucket
+
+Resources:
+
+    # HelloWorldFunction:
+    #     Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    #     Properties:
+    #         CodeUri: hello_world/build/
+    #         Handler: app.lambda_handler
+    #         Runtime: python3.6
+    #         Environment: # More info about Env Vars: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#environment-object
+    #             Variables:
+    #                 PARAM1: VALUE
+    #         Events:
+    #             HelloWorld:
+    #                 Type: Api # More info about API Event Source: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#api
+    #                 Properties:
+    #                     Path: /hello
+    #                     Method: get
+
+    WebsiteBucket:
+        Properties:
+            BucketName: !Sub "storefront-${Stage}-${Region}"
+            WebsiteConfiguration:
+                IndexDocument: index.html
+        Type: "AWS::S3::Bucket"
+
+    WebsiteBucketPolicy:
+        Properties:
+            Bucket: !Ref WebsiteBucket
+            PolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                    -
+                        Effect: Allow
+                        Principal: "*"
+                        Action: s3:GetObject
+                        Resource: !Sub "arn:aws:s3:::${WebsiteBucket}/*"
+        Type: "AWS::S3::BucketPolicy"
+
+    WebsiteContent:
+        Properties:
+            ServiceToken: !GetAtt CopyS3ObjectsFunction.Arn
+            SourceBucket: !Sub "storefront-code-${Stage}-${Region}"
+            SourcePrefix: !Sub "${CodeKeyPrefix}/website/"
+            Bucket: !Ref WebsiteBucket
+        Type: "Custom::S3Objects"
+
+    S3CopyRole:
+        Type: AWS::IAM::Role
+        Properties:
+
+            Path: /storefront/
+            AssumeRolePolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                  -
+                    Effect: Allow
+                    Principal:
+                      Service: lambda.amazonaws.com
+                    Action: sts:AssumeRole
+            Policies:
+                -
+                    PolicyName: S3Access
+                    PolicyDocument:
+                        Version: 2012-10-17
+                        Statement:
+                            -
+                                Sid: AllowLogging
+                                Effect: Allow
+                                Action:
+                                    - "logs:CreateLogGroup"
+                                    - "logs:CreateLogStream"
+                                    - "logs:PutLogEvents"
+                                Resource: "*"
+                            -
+                                Sid: SourceBucketReadAccess
+                                Effect: Allow
+                                Action:
+                                    - "s3:ListBucket"
+                                    - "s3:GetObject"
+                                Resource:
+                                    - !Sub "arn:aws:s3:::${CodeBucket}"
+                                    - !Sub "arn:aws:s3:::${CodeBucket}/${CodeKeyPrefix}/*"
+                            -
+                                Sid: DestBucketWriteAccess
+                                Effect: Allow
+                                Action:
+                                    - "s3:ListBucket"
+                                    - "s3:GetObject"
+                                    - "s3:PutObject"
+                                    - "s3:PutObjectAcl"
+                                    - "s3:PutObjectVersionAcl"
+                                    - "s3:DeleteObject"
+                                    - "s3:DeleteObjectVersion"
+                                Resource:
+                                    - !Sub "arn:aws:s3:::${WebsiteBucket}"
+                                    - !Sub "arn:aws:s3:::${WebsiteBucket}/*"
+
+    CopyS3ObjectsFunction:
+        Properties:
+            Description: Copies objects from a source S3 bucket to a destination
+            Handler: index.handler
+            Runtime: python2.7
+            Role: !GetAtt S3CopyRole.Arn
+            Timeout: 120
+            Code:
+                ZipFile: |
+                  import os
+                  import json
+                  import cfnresponse
+
+                  import boto3
+                  from botocore.exceptions import ClientError
+                  client = boto3.client('s3')
+
+                  import logging
+                  logger = logging.getLogger()
+                  logger.setLevel(logging.INFO)
+
+                  def handler(event, context):
+                    logger.info("Received event: %s" % json.dumps(event))
+                    source_bucket = event['ResourceProperties']['SourceBucket']
+                    source_prefix = event['ResourceProperties'].get('SourcePrefix') or ''
+                    bucket = event['ResourceProperties']['Bucket']
+                    prefix = event['ResourceProperties'].get('Prefix') or ''
+
+                    result = cfnresponse.SUCCESS
+
+                    try:
+                      if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                        result = copy_objects(source_bucket, source_prefix, bucket, prefix)
+                      elif event['RequestType'] == 'Delete':
+                        result = delete_objects(bucket, prefix)
+                    except ClientError as e:
+                      logger.error('Error: %s', e)
+                      result = cfnresponse.FAILED
+
+                    cfnresponse.send(event, context, result, {})
+
+
+                  def copy_objects(source_bucket, source_prefix, bucket, prefix):
+                    paginator = client.get_paginator('list_objects_v2')
+                    page_iterator = paginator.paginate(Bucket=source_bucket, Prefix=source_prefix)
+                    for key in {x['Key'] for page in page_iterator for x in page['Contents']}:
+                      dest_key = os.path.join(prefix, os.path.relpath(key, source_prefix))
+                      if not key.endswith('/'):
+                        print 'copy {} to {}'.format(key, dest_key)
+                        client.copy_object(CopySource={'Bucket': source_bucket, 'Key': key}, Bucket=bucket, Key = dest_key)
+                    return cfnresponse.SUCCESS
+
+                  def delete_objects(bucket, prefix):
+                    paginator = client.get_paginator('list_objects_v2')
+                    page_iterator = paginator.paginate(Bucket=bucket, Prefix=prefix)
+                    objects = [{'Key': x['Key']} for page in page_iterator for x in page['Contents']]
+                    client.delete_objects(Bucket=bucket, Delete={'Objects': objects})
+                    return cfnresponse.SUCCESS
+
+
+        Type: AWS::Lambda::Function
+
+Outputs:
+
+    # HelloWorldApi:
+    #   Description: "API Gateway endpoint URL for Prod stage for Hello World function"
+    #   Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/hello/"
+
+    # HelloWorldFunction:
+    #   Description: "Hello World Lambda Function ARN"
+    #   Value: !GetAtt HelloWorldFunction.Arn
+
+    # HelloWorldFunctionIamRole:
+    #   Description: "Implicit IAM Role created for Hello World function"
+    #   Value: !GetAtt HelloWorldFunctionRole.Arn
+
+    WebsiteURL:
+      Value: !GetAtt WebsiteBucket.WebsiteURL
